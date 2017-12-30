@@ -1,0 +1,1665 @@
+diff -r 1c5e7f81115c lab2/EdBuffer.scala
+--- a/lab2/EdBuffer.scala	Mon Nov 16 09:31:33 2015 +0000
++++ b/lab2/EdBuffer.scala	Thu Feb 04 13:25:53 2016 +0000
+@@ -7,7 +7,7 @@
+ /** The state of an editing session */
+ class EdBuffer {
+     /** The text being edited. */
+-    private val text = new PlaneText()
++    private val text = new PlaneText
+ 
+     /** The display. */
+     private var display: Display = null
+@@ -105,6 +105,10 @@
+ 
+     def writeFile(out: Writer) { text.writeFile(out) }
+ 
++    def indexOfLoop (str: String, fromIndex: Int) = text.indexOfLoop(str, fromIndex)
++
++    def indexOf (str: String, fromIndex: Int) = text.indexOf(str, fromIndex)
++
+ 
+     // Mutator methods
+ 
+@@ -145,6 +149,13 @@
+         text.insert(pos, t)
+     }
+ 
++    def transpose(pos: Int) {
++        var ch: Char = text.charAt(pos)
++        deleteChar(pos)
++        insert(pos-1,ch)
++    }
++
++
+     /** Load a file into the buffer. */
+     def loadFile(name: String) {
+         filename = name
+@@ -230,6 +241,47 @@
+         def redo() { deleteChar(pos) }
+     }
+ 
++    class Transposition(pos: Int) extends Change {
++        def undo() { transpose(pos) }
++        def redo() { transpose(pos) }
++    }
++
++    class SRChange(pos: Int, search: String, replace: String) extends Change {
++        def undo() {
++            point = pos
++            deleteRange(pos, replace.length)
++            insert(pos, search)
++        }
++        def redo() {
++            point = pos
++            deleteRange(pos, search.length)
++            insert(pos, replace)
++        }
++    }
++
++    class SRMassChange(positions: Array[Int], i: Int, search: String, replace: String) extends Change {
++        def undo() {
++            var j = i
++            point = positions(j-1)
++            while (j != 0) {
++                j -= 1
++                var pos = positions(j)
++                deleteRange(pos, replace.length)
++                insert(pos, search)
++            }
++        }
++        def redo() {
++            var j = 0
++            point = positions(0)
++            while (j != i) {
++                var pos = positions(j)
++                deleteRange(pos, search.length)
++                insert(pos, replace)
++                j += 1
++            }
++        }
++    }
++
+     def wrapChange(before: Memento, change: Change, after: Memento) = {
+         if (change == null)
+             null
+diff -r 1c5e7f81115c lab2/Editor.scala
+--- a/lab2/Editor.scala	Mon Nov 16 09:31:33 2015 +0000
++++ b/lab2/Editor.scala	Thu Feb 04 13:25:53 2016 +0000
+@@ -15,6 +15,18 @@
+     
+     /** Whether the command loop should continue */
+     private var alive = true
++
++    /** The default search string for searching the file */
++    private var searchdefault = ""
++
++    /** The default replace string for find and replace in the file */
++    private var replacedefault = ""
++
++    private var searchfor = ""
++    private var replace = ""
++    private var exit = false
++    private var replacecount = 0
++    private var searchcount = 0
+     
+     /** Show the buffer on a specified display */
+     def activate(display: Display) {
+@@ -65,6 +77,10 @@
+             case Editor.PAGEUP =>
+                 p = ed.getPos(row - Editor.SCROLL, 0)
+                 display.scroll(-Editor.SCROLL)
++            case Editor.CTRLHOME =>
++                p = ed.getPos(0,0)
++            case Editor.CTRLEND =>
++                p = ed.getPos(ed.numLines-1,ed.getLineLength(ed.numLines-1))
+             case _ =>
+                 throw new Error("Bad direction")
+         }
+@@ -105,6 +121,70 @@
+         new ed.Deletion(p, ch)
+     }
+     
++    def transposeCommand(): Change = {
++        var p = ed.point
++
++        if ((p == 0)||(p == ed.length)) { beep(); return null }
++        else if (ed.getColumn(p) == (ed.getLineLength(ed.getRow(p))-1)) {
++            p -= 1
++            ed.transpose(p)
++        }
++        else {
++            ed.transpose(p)
++            ed.point = p + 1
++        }
++        ed.setModified()
++        new ed.Transposition(p) 
++    }
++
++    def sRCommand(): Change = {
++        var p = ed.point
++        ed.deleteRange(p, searchfor.length)
++        ed.insert(p, replace)
++        replacecount += 1
++        ed.setModified()
++        new ed.SRChange(p, searchfor, replace)
++    }
++
++    def sRMassCommand(): Change = {
++        var p = ed.point
++        val s = searchfor.length
++        var pos = p + s
++        var max = 100
++        var positions = new Array[Int](max)
++        var i = 0
++        while (pos != -1) {
++            if (i == max) {
++                max = 2*max
++                val newpos = new Array[Int](max)
++                Array.copy(positions, 0, newpos, 0, (max/2))
++                positions = newpos
++            }
++            pos -= s
++            positions(i) = pos
++            ed.deleteRange(pos, s)
++            ed.insert(pos, replace)
++            i += 1
++            pos = ed.indexOf(searchfor, pos + s)
++        }
++        replacecount += i
++        searchcount += (i - 1)
++        ed.setModified()
++        new ed.SRMassChange(positions, i, searchfor, replace)
++    }
++
++    def quitSRCommand() {
++        exit = true
++    }
++
++    def oneRCommand(): Change = {
++        val chng = sRCommand()
++        quitSRCommand()
++        chng
++    }
++
++    def noCommand() { }
++
+     /** Command: Save the file */
+     def saveFileCommand() {
+         val name = 
+@@ -133,6 +213,54 @@
+         if (checkClean("quit")) alive = false
+     }
+ 
++    /** Search the file for a specific sequence of characters */
++    def search() {
++        searchfor = MiniBuffer.readString(display, "Search for", searchdefault)
++        if (searchfor != null && searchfor.length > 0) {
++            searchdefault = searchfor
++            var p = ed.point
++            var res = ed.indexOfLoop (searchfor, p)
++            if (res == -1) { MiniBuffer.message(display, s"No such string, '$searchfor', exists", searchfor) }
++            else if (res == p) { MiniBuffer.message(display, s"This is the only occurrence of the string '$searchfor'", searchfor) }
++            else { ed.point = res }
++        }
++    }
++
++    /** Search the file for a sequence of characters and replace with another */
++    def searchReplace() {
++        searchfor = MiniBuffer.readString(display, "Search for", searchdefault)
++        replace = MiniBuffer.readString(display, "Replace with", replacedefault)
++        replacedefault = replace
++        if (searchfor != null && searchfor.length > 0) {
++            searchdefault = searchfor
++            var p = ed.point
++            exit = false
++            replacecount = 0
++            searchcount = 0
++            while (!exit) {
++                var res = ed.indexOf (searchfor, p)
++                if (res == -1) { exit = true }
++                else {
++                    searchcount += 1
++                    p = res - searchfor.length
++                    ed.point = p
++                    ed.update()
++                    var ans = display.setMessage("Do you wish to replace this occurrence of '%s'?".format(searchfor))
++                    var exitkeyloop = false
++                    while (!exitkeyloop) {
++                        val key = display.getKey()
++                        Editor.srkeymap.find(key) match {
++                            case Some(cmd) => {perform(cmd); exitkeyloop = true}
++                            case None => beep()
++                        }
++                    }
++                    p = res
++                }
++            }
++            MiniBuffer.message(display, s"$searchcount occurrences of '$searchfor' were found, $replacecount were replaced", (searchcount, searchfor, replacecount))
++        }
++    }
++
+ 
+     // Command execution protocol
+     
+@@ -190,6 +318,8 @@
+     val END = 6
+     val PAGEUP = 7
+     val PAGEDOWN = 8
++    val CTRLHOME = 9
++    val CTRLEND = 10
+     
+     /** Amount to scroll the screen for PAGEUP and PAGEDOWN */
+     val SCROLL = Display.HEIGHT - 3
+@@ -221,6 +351,17 @@
+     import scala.language.implicitConversions
+     implicit def fixup(v: Unit): Change = null
+ 
++    val srkeymap = Keymap[Editor => Change](
++        32 -> (_.sRCommand),
++        89 -> (_.sRCommand),
++        121 -> (_.sRCommand),
++        Display.ctrl('?') -> (_.noCommand),
++        78 -> (_.noCommand),
++        110 -> (_.noCommand),
++        538 -> (_.quitSRCommand),
++        46 -> (_.oneRCommand),
++        33 -> (_.sRMassCommand))
++
+     val keymap = Keymap[Editor => Change](
+         Display.RETURN -> (_.insertCommand('\n')),
+         Display.RIGHT -> (_.moveCommand(RIGHT)),
+@@ -231,6 +372,8 @@
+         Display.END -> (_.moveCommand(END)),
+         Display.PAGEUP -> (_.moveCommand(PAGEUP)),
+         Display.PAGEDOWN -> (_.moveCommand(PAGEDOWN)),
++        Display.CTRLHOME -> (_.moveCommand(CTRLHOME)),
++        Display.CTRLEND -> (_.moveCommand(CTRLEND)),
+         Display.ctrl('?') -> (_.deleteCommand(LEFT)),
+         Display.DEL -> (_.deleteCommand(RIGHT)),
+         Display.ctrl('A') -> (_.moveCommand(HOME)),
+@@ -244,7 +387,10 @@
+         Display.ctrl('P') -> (_.moveCommand(UP)),
+         Display.ctrl('Q') -> (_.quit),
+         Display.ctrl('R') -> (_.replaceFileCommand),
++        Display.ctrl('S') -> (_.search),
++        Display.ctrl('T') -> (_.transposeCommand),
+         Display.ctrl('W') -> (_.saveFileCommand),
++        Display.ctrl('U') -> (_.searchReplace),
+         Display.ctrl('Y') -> (_.redo),
+         Display.ctrl('Z') -> (_.undo))
+ 
+diff -r 1c5e7f81115c lab2/LineMap.scala
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/lab2/LineMap.scala	Thu Feb 04 13:25:53 2016 +0000
+@@ -0,0 +1,280 @@
++class LineMap() {
++
++    private var dummy = new Node(0, -1)
++    private var root = new Node(1, dummy, dummy, Math.random().toFloat)
++
++    //global so getColumn can see result of getRow etc
++    private var p = root
++
++    private var curline = 0
++
++    private def length = root.treeChars
++
++    def numLines = root.treeSize
++
++    def getLineLength(n: Int) = {
++        findLine(n)
++        p.linelen
++    }
++
++    def getRow(pos: Int) = {
++        findPos(pos)
++        curline
++    }
++
++    def getColumn(pos: Int) = {
++        val start = linestart(getRow(pos))
++        pos - start
++    }
++
++    def clear() {
++        val prio = Math.random().toFloat
++        root = new Node(1, dummy, dummy, prio)
++    }
++
++    private def linestart(r: Int) = {
++        require(0 <= r && r < numLines)
++        var k = r
++        p = root
++        var start = p.left.treeChars
++        while (k != p.left.treeSize){
++            if (k < p.left.treeSize) {
++                p = p.left
++                start -= (p.linelen+p.right.treeChars)
++            }
++            else {
++                k -= (p.left.treeSize+1)
++                start += (p.linelen+p.right.left.treeChars)
++                p = p.right
++            }
++        }
++        start
++    }
++
++    private def split(t: Node, pos: Int):(Node, Node) = {
++        if (pos == 0) {
++            (dummy, t)
++        }
++        else if (pos == t.treeSize) {
++            (t, dummy)
++        }
++        else if (pos <= t.left.treeSize) {
++            val (q,r) = split(t.left, pos)
++            t.left = r
++            (q,t)
++        }
++        else {
++            val (q,r) = split(t.right, pos-t.left.treeSize-1)
++            t.right = q
++            (t,r)
++        }
++    }
++
++    private def insertNode(n: Int, len: Int) {
++        val prio = Math.random().toFloat
++        root = insertNode(root, n, len, prio)
++    }
++
++    private def insertNode(t: Node, n: Int, len: Int, prio: Float): Node = {
++        if (prio > t.prio) {
++            val (q, r) = split(t, n)
++            new Node(len, q, r, prio)
++        }
++        else {
++            if (n <= t.left.treeSize) {
++                t.left = insertNode(t.left, n, len, prio)
++            }
++            else {
++                t.right = insertNode(t.right, n - t.left.treeSize - 1, len, prio)
++            }
++            t
++        }
++    }
++
++    def insert(pos: Int, ch: Char) {
++        val c = getColumn(pos)
++        val old = p.linelen
++        if (ch != '\n') {
++            deleteNode(curline)
++            insertNode(curline, old+1)
++        }
++        else {
++            deleteNode(curline)
++            insertNode(curline, c+1)
++            insertNode(curline+1, old-c)
++        }
++    }
++
++    def insert(pos: Int, s: String) {
++        val before = getColumn(pos)
++        val after = p.linelen - before
++        var lengths = new Array[Int](s.length+1)
++        var i = 0
++        for (ch <- s) {
++            lengths(i) += 1
++            if (ch == '\n') {
++                i += 1
++            }
++        }
++        lengths(0) += before
++        lengths(i) += after
++        deleteNode(curline)
++        var j = 0
++        while (j <= i) {
++            insertNode(curline+j, lengths(j))
++            j += 1
++        }
++    }
++
++    def insertRange(pos: Int, t: Text, start: Int, nchars: Int) {
++        val s: String = t.subSequence(start, start+nchars).toString
++        insert(pos, s)
++    }
++
++    private def deleteNode(pos:Int) {
++        root = deleteNode(root, pos)
++    }
++
++    private def deleteNode(t: Node, pos: Int): Node ={
++        if (pos == t.left.treeSize) {
++            merge(t.left, t.right)
++        }
++        else {
++            if (pos < t.left.treeSize) {
++                t.left = deleteNode(t.left, pos)
++            }
++            else {
++                t.right = deleteNode(t.right, pos-t.left.treeSize-1)
++            }
++            t
++        }
++    }
++
++    private def merge(t: Node, q: Node):Node = {
++        if (t.prio > q.prio) {
++            if (q.treeSize > 0) {
++                t.right = merge(t.right, q)
++            }
++            t            
++        }
++        else {
++            if (t.treeSize > 0) {
++                q.left = merge(t, q.left)
++            }
++            q
++        }
++    }
++
++    def deleteChar(pos: Int) {
++        val col = getColumn(pos+1)
++        val fstlen = p.linelen
++        deleteNode(curline)
++        if (col != 0) {
++            insertNode(curline, fstlen-1)
++        }
++        else {
++            val sndlen = getLineLength(curline)
++            deleteNode(curline)
++            insertNode(curline, fstlen+sndlen-1)
++        }
++    }
++
++    def deleteRange(start: Int, len: Int) {
++        findPos(start)
++        while (start+len >= (linestart(curline)+ getLineLength(curline))) {
++            var fstlen = p.linelen
++            var sndlen = getLineLength(curline+1)
++            deleteNode(curline)
++            deleteNode(curline)
++            insertNode(curline, fstlen+sndlen)
++        }
++        var fstlen = getLineLength(curline)
++        deleteNode(curline)
++        insertNode(curline, fstlen-len)
++    }
++
++    def getPos(row: Int, col: Int) = {
++        val r = Math.min(Math.max(row, 0), numLines-1)
++        val start:Int = linestart(r)
++        val c = Math.min(Math.max(col, 0), p.linelen-1)
++        start + c
++    }
++
++    def fetchLinePos(n:Int):(Int,Int) = {
++        val start = linestart(n)
++        return (start, p.linelen)
++    }
++
++    private def findLine(r: Int) {
++        require(0 <= r && r < numLines)
++        var k = r
++        p = root
++        while (k != p.left.treeSize){
++            if (k < p.left.treeSize+1) {
++                p = p.left
++            }
++            else {
++                k -= p.left.treeSize+1
++                p = p.right
++            }
++        }
++    }
++
++    private def findPos(pos: Int) {
++        require(0 <= pos && pos < length)
++        var k = pos
++        p = root
++        curline = p.left.treeSize
++        while (k < p.left.treeChars || k >= (p.treeChars - p.right.treeChars)) {
++            if (k < p.left.treeChars) {
++                p = p.left
++                curline -= p.right.treeSize+1
++            }
++            else {
++                k -= (p.treeChars-p.right.treeChars)
++                p = p.right
++                curline += (p.treeSize - p.right.treeSize)
++            }
++        }
++    }
++
++    private class Node(val linelen: Int, val prio: Float) {
++        private var lft: Node = null
++        private var rt: Node = null
++        var treeSize: Int = 0
++        var treeChars: Int = 0
++
++        def this(len: Int, lft: Node, rt: Node, prio: Float){
++            this(len, prio)
++            this.lft = lft
++            this.rt = rt
++            setTreeSize()
++            setTreeChars()
++        }
++
++        private def setTreeSize() {
++            treeSize = left.treeSize + right.treeSize + 1
++        }
++
++        private def setTreeChars() {
++            treeChars = left.treeChars + right.treeChars + linelen
++        }
++
++        def left = lft
++
++        def left_= (lft: Node) {
++            this.lft = lft
++            setTreeSize()
++            setTreeChars()
++        }
++
++        def right = rt
++
++        def right_= (rt: Node) {
++            this.rt = rt
++            setTreeSize()
++            setTreeChars()
++        }
++    }
++
++}
+\ No newline at end of file
+diff -r 1c5e7f81115c lab2/Makefile
+--- a/lab2/Makefile	Mon Nov 16 09:31:33 2015 +0000
++++ b/lab2/Makefile	Thu Feb 04 13:25:53 2016 +0000
+@@ -2,7 +2,7 @@
+ 
+ SOURCE = Undoable.scala Text.scala PlaneText.scala Terminal.scala \
+ 	Keymap.scala Display.scala EdBuffer.scala MiniBuffer.scala \
+-	Editor.scala Testbed.scala
++	LineMap.scala Editor.scala Testbed.scala
+ 
+ .compiled: $(SOURCE)
+ 	@mkdir -p bin
+diff -r 1c5e7f81115c lab2/MiniBuffer.scala
+--- a/lab2/MiniBuffer.scala	Mon Nov 16 09:31:33 2015 +0000
++++ b/lab2/MiniBuffer.scala	Thu Feb 04 13:25:53 2016 +0000
+@@ -9,9 +9,11 @@
+     private val text = new Text(100)
+     private var _pos = 0
+     private var _status = MiniBuffer.NORMAL
+-        
++
+     if (default != null) text.insert(0, default)
+     
++    var srinstr: Char = 'x'
++
+     /** Get the status: ABORT if the editing was aborted with Ctrl-G. */
+     def status = _status
+     
+@@ -103,6 +105,8 @@
+         Display.ctrl('G') -> (_.abort),
+         Display.ctrl('?') -> (_.deleteLeft))
+ 
++    
++
+     for (ch <- Display.printable)
+         keymap += ch -> (_.insertChar(ch.toChar))
+         
+@@ -128,7 +132,7 @@
+         display.getKey(); // Any key will do!
+         mini.setVisible(false)
+     }
+-    
++
+     /** Use the minibuffer to ask a yes/no question.  Unless the user types
+      * "yes" exactly, the default answer is "no". */
+     def ask(display: Display, question: String) = {
+diff -r 1c5e7f81115c lab2/PlaneText.scala
+--- a/lab2/PlaneText.scala	Mon Nov 16 09:31:33 2015 +0000
++++ b/lab2/PlaneText.scala	Thu Feb 04 13:25:53 2016 +0000
+@@ -3,181 +3,71 @@
+ 
+ /** An extension of Text that keeps track of the division of the 
+  * text into lines. */
+-class PlaneText(init: Int) extends Text() {
+-    /* For present purposes, we count each newline character as part of the
+-     * line it terminates, so that every line has non-zero length.  Let's
+-     * also imagine that a special terminator character is added to the end of
+-     * the text, so that the very last line also has non-zero length.  For an
+-     * ordinary text file that ends in a newline, this last line will be empty
+-     * and be counted as having length 1, and the editor will count the
+-     * file as having one more line than there are newline characters. */
+-    private var nlines = 1
+-    private var linelen = new Array[Int](init)
+-    linelen(0) = 1
+-    
+-    /* For efficiency, we keep track of the beginning of the most recent line
+-     * that was accessed.  This will help a lot if accesses are clustered. 
+-     * The invariant is linestart = sum linelen[0..curline) */
+-    private var curline = 0
+-    private var linestart = 0
+-    
+-    def this() { this(1000) }
++class PlaneText extends Text() {
++
++    private var linemap = new LineMap()
+     
+     /** Return the number of lines, including the fictitious last line. */
+-    def numLines = nlines
++    def numLines = linemap.numLines
+     
+     /** Return the length of a line in the file */
+-    def getLineLength(n: Int) = linelen(n)
++    def getLineLength(n: Int) = linemap.getLineLength(n)
+     
+     /** Find the line number corresponding to a character index. */
+-    def getRow(pos: Int) = {
+-        findPos(pos); curline
+-    }
++    def getRow(pos: Int) = linemap.getRow(pos)
+     
+     /** Find the column number of a character index in its line. */
+-    def getColumn(pos: Int) = {
+-        findPos(pos); pos - linestart
+-    }
++    def getColumn(pos: Int) = linemap.getColumn(pos)
+     
+     // Augment the mutator methods of Text to maintain the line map
+     
+     override def clear() {
+         super.clear()
+-        nlines = 1
+-        linelen(0) = 1
+-        curline = 0
+-        linestart = 0
++        linemap.clear()
+     }
+     
+     override def insert(pos: Int, ch: Char) {
+         super.insert(pos, ch)
+-        findPos(pos)
+-        if (ch != '\n')
+-            linelen(curline) += 1
+-        else 
+-            mapLines()
++        linemap.insert(pos, ch)
+     }
+ 
+     override def insert(pos: Int, s: String) {
+         super.insert(pos, s)
+-        mapLines()
++        linemap.insert(pos, s)
+     }
+     
+     override def insertRange(pos: Int, t: Text, start: Int, nchars: Int) {
+         super.insertRange(pos, t, start, nchars)
+-        mapLines()
++        linemap.insertRange(pos, t, start, nchars)
+     }
+ 
+     override def insertFile(pos: Int, in: java.io.Reader) {
++        val prevlen = length
+         try { 
+             super.insertFile(pos, in)
+         } finally {
+-            // Even if an IOException is thrown, we still update the line map
+-            mapLines()
++            val s = subSequence(pos, (length-prevlen)).toString
++            linemap.insert(pos,s)
+         }
+     }
+-    
++
+     override def deleteChar(pos: Int) {
+-        val ch = charAt(pos)
+         super.deleteChar(pos)
+-        findPos(pos)
+-        if (ch != '\n')
+-            linelen(curline) -= 1
+-        else 
+-            mapLines()
++        linemap.deleteChar(pos)
++    }
++     
++    override def deleteRange(start: Int, len: Int) {
++        super.deleteRange(start, len)
++        linemap.deleteRange(start, len)
+     }
+ 
+-    override def deleteRange(start: Int, len: Int) {
+-        super.deleteRange(start, len)
+-        
+-        findPos(start)
+-        if (start + len < linestart + linelen(curline))
+-            linelen(curline) -= len
+-        else
+-            mapLines()
+-    }
++    /** Return the editing position closest to the specified coordinates */
++    def getPos(row: Int, col: Int) = linemap.getPos(row, col)  
+ 
++    /** Fetch the text of line n, without the trailing newline */
++    def fetchLine(n: Int, buf: Text) = {
++        var (beforestart, linelength) = linemap.fetchLinePos(n)
++        getRange(beforestart, linelength-1, buf) //use beforestart not beforestart+1 as the first character in buffer is at index 0
++    }    
+ 
+-    /** Return the editing position closest to the specified coordinates */
+-    def getPos(row: Int, col: Int) = {
+-        val r = Math.min(Math.max(row, 0), nlines-1)
+-        findLine(r)
+-        val c = Math.min(Math.max(col, 0), linelen(curline)-1)
+-        linestart + c
+-    }
+-    
+-    /** Fetch the text of line n, without the trailing newline */
+-    def fetchLine(n: Int, buf: Text) {
+-        findLine(n)
+-        getRange(linestart, linelen(n)-1, buf)
+-    }
+-    
+-    /** Refresh the line map by scanning the whole file.
+-     * This is always a last resort if we choose not to update the
+-     * line map in a faster way. */
+-    private def mapLines() {
+-        nlines = 0
+-        var c = 0
+-
+-        for (i <- 0 until length) {
+-            c += 1
+-            if (charAt(i) == '\n') {
+-                lineRoom()
+-                linelen(nlines) = c
+-                nlines += 1; c = 0
+-            } 
+-        }
+-        
+-        lineRoom()
+-        linelen(nlines) = c+1
+-        nlines += 1
+-        
+-        // Reset the cache
+-        curline = 0; linestart = 0
+-    }
+-    
+-    /** Set curline to a specified line number. */
+-    private def findLine(n: Int) {
+-        assert(n >= 0 && n < nlines)
+-        
+-        // Move forwards if necessary
+-        while (n > curline) {
+-            linestart += linelen(curline)
+-            curline += 1
+-        }
+-
+-        // Move backwards if necessary
+-        while (n < curline) {
+-            curline -= 1
+-            linestart -= linelen(curline)
+-        }
+-    }
+-    
+-    /** Set current line so that it contains a specified character index. */
+-    private def findPos(j: Int) {
+-        assert(j >= 0 && j <= length)
+-
+-        // Move forwards if necessary
+-        while (j >= linestart + linelen(curline)) {
+-            linestart += linelen(curline)
+-            curline += 1
+-        }
+-        
+-        // Move backwards if necessary
+-        while (j < linestart) {
+-            curline -= 1
+-            linestart -= linelen(curline)
+-        }
+-        
+-        assert(linestart <= j && j < linestart + linelen(curline))
+-    }
+-    
+-    /** Find room for one more line */
+-    private def lineRoom() {
+-        if (nlines >= linelen.length) {
+-            val newlen = new Array[Int](2*linelen.length)
+-            Array.copy(linelen, 0, newlen, 0, nlines)
+-            linelen = newlen
+-        }
+-    }
+ }
+diff -r 1c5e7f81115c lab2/Text.scala
+--- a/lab2/Text.scala	Mon Nov 16 09:31:33 2015 +0000
++++ b/lab2/Text.scala	Thu Feb 04 13:25:53 2016 +0000
+@@ -40,6 +40,46 @@
+         else
+             buffer(max-len+pos)
+     }
++
++    /** Find the next occurence of a string from a named index */
++
++    def indexOfLoop (str: String, fromIndex: Int): Int = {
++        val n: Int = str.length()
++        var i: Int = fromIndex
++        if (i < n-1) { i = n-1 }
++        while (i + 1 <= length) {
++            i += 1
++            if (str == getString(i-n, n)) {
++                /** The index of the final character in the sequence is returned */
++                return i
++            }
++        }
++        /** If the end of the file is reached, the search loops to the beginning */
++        i = n-1
++        if (fromIndex >= n-1) {
++            while (i < fromIndex) {
++                i += 1
++                if (str == getString(i-n, n)) {
++                    return i
++                }
++            }
++        }
++        -1
++    }
++
++    def indexOf (str: String, fromIndex: Int): Int = {
++        val n: Int = str.length()
++        var i: Int = fromIndex
++        if (i < n-1) { i = n-1 }
++        while (i + 1 <= length) {
++            i += 1
++            if (str == getString(i-n, n)) {
++                /** The index of the final character in the sequence is returned */
++                return i
++            }
++        }
++        -1
++    }
+     
+     // Mutators: any changes or additions here require similar changes to
+     // the subclass PlaneText (the fragile base class problem).
+diff -r 1c5e7f81115c lab2/file.txt
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/lab2/file.txt	Thu Feb 04 13:25:53 2016 +0000
+@@ -0,0 +1,35 @@
++If you can keep your head when all about you   
++    Are losing theirs and blaming it on you,   
++If you can trust yourself when all men doubt you,
++    But make allowance for their doubting too;   
++If you can wait and not be tired by waiting,
++    Or being lied about, don’t deal in lies,
++Or being hated, don’t give way to hating,
++    And yet don’t look too good, nor talk too wise:
++
++If you can dream—and not make dreams your master;   
++    If you can think—and not make thoughts your aim;   
++If you can meet with Triumph and Disaster
++    And treat those two impostors just the same;   
++If you can bear to hear the truth you’ve spoken
++    Twisted by knaves to make a trap for fools,
++Or watch the things you gave your life to, broken,
++    And stoop and build ’em up with worn-out tools:
++
++If you can make one heap of all your winnings
++    And risk it on one turn of pitch-and-toss,
++And lose, and start again at your beginnings
++    And never breathe a word about your loss;
++If you can force your heart and nerve and sinew
++    To serve your turn long after they are gone,   
++And so hold on when there is nothing in you
++    Except the Will which says to them: ‘Hold on!’
++
++If you can talk with crowds and keep your virtue,   
++    Or walk with Kings—nor lose the common touch,
++If neither foes nor loving friends can hurt you,
++    If all men count with you, but none too much;
++If you can fill the unforgiving minute
++    With sixty seconds’ worth of distance run,   
++Yours is the Earth and everything that’s in it,   
++    And—which is more—you’ll be a Man, my son!
+diff -r 1c5e7f81115c lab2/file.txt~
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/lab2/file.txt~	Thu Feb 04 13:25:53 2016 +0000
+@@ -0,0 +1,94 @@
++The most important thing we've learned,
++So far as children are concerned,
++Is never, NEVER, NEVER let
++Them near your television set --
++Or better still, just don't install
++The idiotic thing at all.
++In almost every house we've been,
++We've watched them gaping at the screen.
++They loll and slop and lounge about,
++And stare until their eyes pop out.
++(Last week in someone's place we saw
++A dozen eyeballs on the floor.)
++They sit and stare and stare and sit
++Until they're hypnotised by it,
++Until they're absolutely drunk
++With all that shocking ghastly junk.
++Oh yes, we know it keeps them still,
++They don't climb out the window sill,
++They never fight or kick or punch,
++They leave you free to cook the lunch
++And wash the dishes in the sink --
++But did you ever stop to think,
++To wonder just exactly what
++This does to your beloved tot?
++IT ROTS THE SENSE IN THE HEAD!
++IT KILLS IMAGINATION DEAD!
++IT CLOGS AND CLUTTERS UP THE MIND!
++IT MAKES A CHILD SO DULL AND BLIND
++HE CAN NO LONGER UNDERSTAND
++A FANTASY, A FAIRYLAND!
++HIS BRAIN BECOMES AS SOFT AS CHEESE!
++HIS POWERS OF THINKING RUST AND FREEZE!
++HE CANNOT THINK -- HE ONLY SEES!
++'All right!' you'll cry. 'All right!' you'll say,
++'But if we take the set away,
++What shall we do to entertain
++Our darling children? Please explain!'
++We'll answer this by asking you,
++'What used the darling ones to do?
++'How used they keep themselves contented
++Before this monster was invented?'
++Have you forgotten? Don't you know?
++We'll say it very loud and slow:
++THEY ... USED ... TO ... READ! They'd READ and READ,
++AND READ and READ, and then proceed
++To READ some more. Great Scott! Gadzooks!
++One half their lives was reading books!
++The nursery shelves held books galore!
++Books cluttered up the nursery floor!
++And in the bedroom, by the bed,
++More books were waiting to be read!
++Such wondrous, fine, fantastic tales
++Of dragons, gypsies, queens, and whales
++And treasure isles, and distant shores
++Where smugglers rowed with muffled oars,
++And pirates wearing purple pants,
++And sailing ships and elephants,
++And cannibals crouching 'round the pot,
++Stirring away at something hot.
++(It smells so good, what can it be?
++Good gracious, it's Penelope.)
++The younger ones had Beatrix Potter
++With Mr. Tod, the dirty rotter,
++And Squirrel Nutkin, Pigling Bland,
++And Mrs. Tiggy-Winkle and-
++Just How The Camel Got His Hump,
++And How the Monkey Lost His Rump,
++And Mr. Toad, and bless my soul,
++There's Mr. Rat and Mr. Mole-
++Oh, books, what books they used to know,
++Those children living long ago!
++So please, oh please, we beg, we pray,
++Go throw your TV set away,
++And in its place you can install
++A lovely bookshelf on the wall.
++Then fill the shelves with lots of books,
++Ignoring all the dirty looks,
++The screams and yells, the bites and kicks,
++And children hitting you with sticks-
++Fear not, because we promise you
++That, in about a week or two
++Of having nothing else to do,
++They'll now begin to feel the need
++Of having something to read.
++And once they start -- oh boy, oh boy!
++You watch the slowly growing joy
++That fills their hearts. They'll grow so keen
++They'll wonder what they'd ever seen
++In that ridiculous machine,
++That nauseating, foul, unclean,
++Repulsive television screen!
++And later, each and every kid
++Will love you more for what you did.
++Roald Dahl
+\ No newline at end of file
+diff -r 1c5e7f81115c lab2/output.txt
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/lab2/output.txt	Thu Feb 04 13:25:53 2016 +0000
+@@ -0,0 +1,600 @@
++diff -r 1c5e7f81115c lab2/EdBuffer.scala
++--- a/lab2/EdBuffer.scala	Mon Nov 16 09:31:33 2015 +0000
+++++ b/lab2/EdBuffer.scala	Thu Feb 04 13:23:01 2016 +0000
++@@ -7,7 +7,7 @@
++ /** The state of an editing session */
++ class EdBuffer {
++     /** The text being edited. */
++-    private val text = new PlaneText()
+++    private val text = new PlaneText
++ 
++     /** The display. */
++     private var display: Display = null
++@@ -105,6 +105,10 @@
++ 
++     def writeFile(out: Writer) { text.writeFile(out) }
++ 
+++    def indexOfLoop (str: String, fromIndex: Int) = text.indexOfLoop(str, fromIndex)
+++
+++    def indexOf (str: String, fromIndex: Int) = text.indexOf(str, fromIndex)
+++
++ 
++     // Mutator methods
++ 
++@@ -145,6 +149,13 @@
++         text.insert(pos, t)
++     }
++ 
+++    def transpose(pos: Int) {
+++        var ch: Char = text.charAt(pos)
+++        deleteChar(pos)
+++        insert(pos-1,ch)
+++    }
+++
+++
++     /** Load a file into the buffer. */
++     def loadFile(name: String) {
++         filename = name
++@@ -230,6 +241,47 @@
++         def redo() { deleteChar(pos) }
++     }
++ 
+++    class Transposition(pos: Int) extends Change {
+++        def undo() { transpose(pos) }
+++        def redo() { transpose(pos) }
+++    }
+++
+++    class SRChange(pos: Int, search: String, replace: String) extends Change {
+++        def undo() {
+++            point = pos
+++            deleteRange(pos, replace.length)
+++            insert(pos, search)
+++        }
+++        def redo() {
+++            point = pos
+++            deleteRange(pos, search.length)
+++            insert(pos, replace)
+++        }
+++    }
+++
+++    class SRMassChange(positions: Array[Int], i: Int, search: String, replace: String) extends Change {
+++        def undo() {
+++            var j = i
+++            point = positions(j-1)
+++            while (j != 0) {
+++                j -= 1
+++                var pos = positions(j)
+++                deleteRange(pos, replace.length)
+++                insert(pos, search)
+++            }
+++        }
+++        def redo() {
+++            var j = 0
+++            point = positions(0)
+++            while (j != i) {
+++                var pos = positions(j)
+++                deleteRange(pos, search.length)
+++                insert(pos, replace)
+++                j += 1
+++            }
+++        }
+++    }
+++
++     def wrapChange(before: Memento, change: Change, after: Memento) = {
++         if (change == null)
++             null
++diff -r 1c5e7f81115c lab2/Editor.scala
++--- a/lab2/Editor.scala	Mon Nov 16 09:31:33 2015 +0000
+++++ b/lab2/Editor.scala	Thu Feb 04 13:23:01 2016 +0000
++@@ -15,6 +15,18 @@
++     
++     /** Whether the command loop should continue */
++     private var alive = true
+++
+++    /** The default search string for searching the file */
+++    private var searchdefault = ""
+++
+++    /** The default replace string for find and replace in the file */
+++    private var replacedefault = ""
+++
+++    private var searchfor = ""
+++    private var replace = ""
+++    private var exit = false
+++    private var replacecount = 0
+++    private var searchcount = 0
++     
++     /** Show the buffer on a specified display */
++     def activate(display: Display) {
++@@ -65,6 +77,10 @@
++             case Editor.PAGEUP =>
++                 p = ed.getPos(row - Editor.SCROLL, 0)
++                 display.scroll(-Editor.SCROLL)
+++            case Editor.CTRLHOME =>
+++                p = ed.getPos(0,0)
+++            case Editor.CTRLEND =>
+++                p = ed.getPos(ed.numLines-1,ed.getLineLength(ed.numLines-1))
++             case _ =>
++                 throw new Error("Bad direction")
++         }
++@@ -105,6 +121,70 @@
++         new ed.Deletion(p, ch)
++     }
++     
+++    def transposeCommand(): Change = {
+++        var p = ed.point
+++
+++        if ((p == 0)||(p == ed.length)) { beep(); return null }
+++        else if (ed.getColumn(p) == (ed.getLineLength(ed.getRow(p))-1)) {
+++            p -= 1
+++            ed.transpose(p)
+++        }
+++        else {
+++            ed.transpose(p)
+++            ed.point = p + 1
+++        }
+++        ed.setModified()
+++        new ed.Transposition(p) 
+++    }
+++
+++    def sRCommand(): Change = {
+++        var p = ed.point
+++        ed.deleteRange(p, searchfor.length)
+++        ed.insert(p, replace)
+++        replacecount += 1
+++        ed.setModified()
+++        new ed.SRChange(p, searchfor, replace)
+++    }
+++
+++    def sRMassCommand(): Change = {
+++        var p = ed.point
+++        val s = searchfor.length
+++        var pos = p + s
+++        var max = 100
+++        var positions = new Array[Int](max)
+++        var i = 0
+++        while (pos != -1) {
+++            if (i == max) {
+++                max = 2*max
+++                val newpos = new Array[Int](max)
+++                Array.copy(positions, 0, newpos, 0, (max/2))
+++                positions = newpos
+++            }
+++            pos -= s
+++            positions(i) = pos
+++            ed.deleteRange(pos, s)
+++            ed.insert(pos, replace)
+++            i += 1
+++            pos = ed.indexOf(searchfor, pos + s)
+++        }
+++        replacecount += i
+++        searchcount += (i - 1)
+++        ed.setModified()
+++        new ed.SRMassChange(positions, i, searchfor, replace)
+++    }
+++
+++    def quitSRCommand() {
+++        exit = true
+++    }
+++
+++    def oneRCommand(): Change = {
+++        val chng = sRCommand()
+++        quitSRCommand()
+++        chng
+++    }
+++
+++    def noCommand() { }
+++
++     /** Command: Save the file */
++     def saveFileCommand() {
++         val name = 
++@@ -133,6 +213,54 @@
++         if (checkClean("quit")) alive = false
++     }
++ 
+++    /** Search the file for a specific sequence of characters */
+++    def search() {
+++        searchfor = MiniBuffer.readString(display, "Search for", searchdefault)
+++        if (searchfor != null && searchfor.length > 0) {
+++            searchdefault = searchfor
+++            var p = ed.point
+++            var res = ed.indexOfLoop (searchfor, p)
+++            if (res == -1) { MiniBuffer.message(display, s"No such string, '$searchfor', exists", searchfor) }
+++            else if (res == p) { MiniBuffer.message(display, s"This is the only occurrence of the string '$searchfor'", searchfor) }
+++            else { ed.point = res }
+++        }
+++    }
+++
+++    /** Search the file for a sequence of characters and replace with another */
+++    def searchReplace() {
+++        searchfor = MiniBuffer.readString(display, "Search for", searchdefault)
+++        replace = MiniBuffer.readString(display, "Replace with", replacedefault)
+++        replacedefault = replace
+++        if (searchfor != null && searchfor.length > 0) {
+++            searchdefault = searchfor
+++            var p = ed.point
+++            exit = false
+++            replacecount = 0
+++            searchcount = 0
+++            while (!exit) {
+++                var res = ed.indexOf (searchfor, p)
+++                if (res == -1) { exit = true }
+++                else {
+++                    searchcount += 1
+++                    p = res - searchfor.length
+++                    ed.point = p
+++                    ed.update()
+++                    var ans = display.setMessage("Do you wish to replace this occurrence of '%s'?".format(searchfor))
+++                    var exitkeyloop = false
+++                    while (!exitkeyloop) {
+++                        val key = display.getKey()
+++                        Editor.srkeymap.find(key) match {
+++                            case Some(cmd) => {perform(cmd); exitkeyloop = true}
+++                            case None => beep()
+++                        }
+++                    }
+++                    p = res
+++                }
+++            }
+++            MiniBuffer.message(display, s"$searchcount occurrences of '$searchfor' were found, $replacecount were replaced", (searchcount, searchfor, replacecount))
+++        }
+++    }
+++
++ 
++     // Command execution protocol
++     
++@@ -190,6 +318,8 @@
++     val END = 6
++     val PAGEUP = 7
++     val PAGEDOWN = 8
+++    val CTRLHOME = 9
+++    val CTRLEND = 10
++     
++     /** Amount to scroll the screen for PAGEUP and PAGEDOWN */
++     val SCROLL = Display.HEIGHT - 3
++@@ -221,6 +351,17 @@
++     import scala.language.implicitConversions
++     implicit def fixup(v: Unit): Change = null
++ 
+++    val srkeymap = Keymap[Editor => Change](
+++        32 -> (_.sRCommand),
+++        89 -> (_.sRCommand),
+++        121 -> (_.sRCommand),
+++        Display.ctrl('?') -> (_.noCommand),
+++        78 -> (_.noCommand),
+++        110 -> (_.noCommand),
+++        538 -> (_.quitSRCommand),
+++        46 -> (_.oneRCommand),
+++        33 -> (_.sRMassCommand))
+++
++     val keymap = Keymap[Editor => Change](
++         Display.RETURN -> (_.insertCommand('\n')),
++         Display.RIGHT -> (_.moveCommand(RIGHT)),
++@@ -231,6 +372,8 @@
++         Display.END -> (_.moveCommand(END)),
++         Display.PAGEUP -> (_.moveCommand(PAGEUP)),
++         Display.PAGEDOWN -> (_.moveCommand(PAGEDOWN)),
+++        Display.CTRLHOME -> (_.moveCommand(CTRLHOME)),
+++        Display.CTRLEND -> (_.moveCommand(CTRLEND)),
++         Display.ctrl('?') -> (_.deleteCommand(LEFT)),
++         Display.DEL -> (_.deleteCommand(RIGHT)),
++         Display.ctrl('A') -> (_.moveCommand(HOME)),
++@@ -244,7 +387,10 @@
++         Display.ctrl('P') -> (_.moveCommand(UP)),
++         Display.ctrl('Q') -> (_.quit),
++         Display.ctrl('R') -> (_.replaceFileCommand),
+++        Display.ctrl('S') -> (_.search),
+++        Display.ctrl('T') -> (_.transposeCommand),
++         Display.ctrl('W') -> (_.saveFileCommand),
+++        Display.ctrl('U') -> (_.searchReplace),
++         Display.ctrl('Y') -> (_.redo),
++         Display.ctrl('Z') -> (_.undo))
++ 
++diff -r 1c5e7f81115c lab2/Makefile
++--- a/lab2/Makefile	Mon Nov 16 09:31:33 2015 +0000
+++++ b/lab2/Makefile	Thu Feb 04 13:23:01 2016 +0000
++@@ -2,7 +2,7 @@
++ 
++ SOURCE = Undoable.scala Text.scala PlaneText.scala Terminal.scala \
++ 	Keymap.scala Display.scala EdBuffer.scala MiniBuffer.scala \
++-	Editor.scala Testbed.scala
+++	LineMap.scala Editor.scala Testbed.scala
++ 
++ .compiled: $(SOURCE)
++ 	@mkdir -p bin
++diff -r 1c5e7f81115c lab2/MiniBuffer.scala
++--- a/lab2/MiniBuffer.scala	Mon Nov 16 09:31:33 2015 +0000
+++++ b/lab2/MiniBuffer.scala	Thu Feb 04 13:23:01 2016 +0000
++@@ -9,9 +9,11 @@
++     private val text = new Text(100)
++     private var _pos = 0
++     private var _status = MiniBuffer.NORMAL
++-        
+++
++     if (default != null) text.insert(0, default)
++     
+++    var srinstr: Char = 'x'
+++
++     /** Get the status: ABORT if the editing was aborted with Ctrl-G. */
++     def status = _status
++     
++@@ -103,6 +105,8 @@
++         Display.ctrl('G') -> (_.abort),
++         Display.ctrl('?') -> (_.deleteLeft))
++ 
+++    
+++
++     for (ch <- Display.printable)
++         keymap += ch -> (_.insertChar(ch.toChar))
++         
++@@ -128,7 +132,7 @@
++         display.getKey(); // Any key will do!
++         mini.setVisible(false)
++     }
++-    
+++
++     /** Use the minibuffer to ask a yes/no question.  Unless the user types
++      * "yes" exactly, the default answer is "no". */
++     def ask(display: Display, question: String) = {
++diff -r 1c5e7f81115c lab2/PlaneText.scala
++--- a/lab2/PlaneText.scala	Mon Nov 16 09:31:33 2015 +0000
+++++ b/lab2/PlaneText.scala	Thu Feb 04 13:23:01 2016 +0000
++@@ -3,181 +3,71 @@
++ 
++ /** An extension of Text that keeps track of the division of the 
++  * text into lines. */
++-class PlaneText(init: Int) extends Text() {
++-    /* For present purposes, we count each newline character as part of the
++-     * line it terminates, so that every line has non-zero length.  Let's
++-     * also imagine that a special terminator character is added to the end of
++-     * the text, so that the very last line also has non-zero length.  For an
++-     * ordinary text file that ends in a newline, this last line will be empty
++-     * and be counted as having length 1, and the editor will count the
++-     * file as having one more line than there are newline characters. */
++-    private var nlines = 1
++-    private var linelen = new Array[Int](init)
++-    linelen(0) = 1
++-    
++-    /* For efficiency, we keep track of the beginning of the most recent line
++-     * that was accessed.  This will help a lot if accesses are clustered. 
++-     * The invariant is linestart = sum linelen[0..curline) */
++-    private var curline = 0
++-    private var linestart = 0
++-    
++-    def this() { this(1000) }
+++class PlaneText extends Text() {
+++
+++    private var linemap = new LineMap()
++     
++     /** Return the number of lines, including the fictitious last line. */
++-    def numLines = nlines
+++    def numLines = linemap.numLines
++     
++     /** Return the length of a line in the file */
++-    def getLineLength(n: Int) = linelen(n)
+++    def getLineLength(n: Int) = linemap.getLineLength(n)
++     
++     /** Find the line number corresponding to a character index. */
++-    def getRow(pos: Int) = {
++-        findPos(pos); curline
++-    }
+++    def getRow(pos: Int) = linemap.getRow(pos)
++     
++     /** Find the column number of a character index in its line. */
++-    def getColumn(pos: Int) = {
++-        findPos(pos); pos - linestart
++-    }
+++    def getColumn(pos: Int) = linemap.getColumn(pos)
++     
++     // Augment the mutator methods of Text to maintain the line map
++     
++     override def clear() {
++         super.clear()
++-        nlines = 1
++-        linelen(0) = 1
++-        curline = 0
++-        linestart = 0
+++        linemap.clear()
++     }
++     
++     override def insert(pos: Int, ch: Char) {
++         super.insert(pos, ch)
++-        findPos(pos)
++-        if (ch != '\n')
++-            linelen(curline) += 1
++-        else 
++-            mapLines()
+++        linemap.insert(pos, ch)
++     }
++ 
++     override def insert(pos: Int, s: String) {
++         super.insert(pos, s)
++-        mapLines()
+++        linemap.insert(pos, s)
++     }
++     
++     override def insertRange(pos: Int, t: Text, start: Int, nchars: Int) {
++         super.insertRange(pos, t, start, nchars)
++-        mapLines()
+++        linemap.insertRange(pos, t, start, nchars)
++     }
++ 
++     override def insertFile(pos: Int, in: java.io.Reader) {
+++        val prevlen = length
++         try { 
++             super.insertFile(pos, in)
++         } finally {
++-            // Even if an IOException is thrown, we still update the line map
++-            mapLines()
+++            val s = subSequence(pos, (length-prevlen)).toString
+++            linemap.insert(pos,s)
++         }
++     }
++-    
+++
++     override def deleteChar(pos: Int) {
++-        val ch = charAt(pos)
++         super.deleteChar(pos)
++-        findPos(pos)
++-        if (ch != '\n')
++-            linelen(curline) -= 1
++-        else 
++-            mapLines()
+++        linemap.deleteChar(pos)
+++    }
+++     
+++    override def deleteRange(start: Int, len: Int) {
+++        super.deleteRange(start, len)
+++        linemap.deleteRange(start, len)
++     }
++ 
++-    override def deleteRange(start: Int, len: Int) {
++-        super.deleteRange(start, len)
++-        
++-        findPos(start)
++-        if (start + len < linestart + linelen(curline))
++-            linelen(curline) -= len
++-        else
++-            mapLines()
++-    }
+++    /** Return the editing position closest to the specified coordinates */
+++    def getPos(row: Int, col: Int) = linemap.getPos(row, col)  
++ 
+++    /** Fetch the text of line n, without the trailing newline */
+++    def fetchLine(n: Int, buf: Text) = {
+++        var (beforestart, linelength) = linemap.fetchLinePos(n)
+++        getRange(beforestart, linelength-1, buf) //use beforestart not beforestart+1 as the first character in buffer is at index 0
+++    }    
++ 
++-    /** Return the editing position closest to the specified coordinates */
++-    def getPos(row: Int, col: Int) = {
++-        val r = Math.min(Math.max(row, 0), nlines-1)
++-        findLine(r)
++-        val c = Math.min(Math.max(col, 0), linelen(curline)-1)
++-        linestart + c
++-    }
++-    
++-    /** Fetch the text of line n, without the trailing newline */
++-    def fetchLine(n: Int, buf: Text) {
++-        findLine(n)
++-        getRange(linestart, linelen(n)-1, buf)
++-    }
++-    
++-    /** Refresh the line map by scanning the whole file.
++-     * This is always a last resort if we choose not to update the
++-     * line map in a faster way. */
++-    private def mapLines() {
++-        nlines = 0
++-        var c = 0
++-
++-        for (i <- 0 until length) {
++-            c += 1
++-            if (charAt(i) == '\n') {
++-                lineRoom()
++-                linelen(nlines) = c
++-                nlines += 1; c = 0
++-            } 
++-        }
++-        
++-        lineRoom()
++-        linelen(nlines) = c+1
++-        nlines += 1
++-        
++-        // Reset the cache
++-        curline = 0; linestart = 0
++-    }
++-    
++-    /** Set curline to a specified line number. */
++-    private def findLine(n: Int) {
++-        assert(n >= 0 && n < nlines)
++-        
++-        // Move forwards if necessary
++-        while (n > curline) {
++-            linestart += linelen(curline)
++-            curline += 1
++-        }
++-
++-        // Move backwards if necessary
++-        while (n < curline) {
++-            curline -= 1
++-            linestart -= linelen(curline)
++-        }
++-    }
++-    
++-    /** Set current line so that it contains a specified character index. */
++-    private def findPos(j: Int) {
++-        assert(j >= 0 && j <= length)
++-
++-        // Move forwards if necessary
++-        while (j >= linestart + linelen(curline)) {
++-            linestart += linelen(curline)
++-            curline += 1
++-        }
++-        
++-        // Move backwards if necessary
++-        while (j < linestart) {
++-            curline -= 1
++-            linestart -= linelen(curline)
++-        }
++-        
++-        assert(linestart <= j && j < linestart + linelen(curline))
++-    }
++-    
++-    /** Find room for one more line */
++-    private def lineRoom() {
++-        if (nlines >= linelen.length) {
++-            val newlen = new Array[Int](2*linelen.length)
++-            Array.copy(linelen, 0, newlen, 0, nlines)
++-            linelen = newlen
++-        }
++-    }
++ }
++diff -r 1c5e7f81115c lab2/Text.scala
++--- a/lab2/Text.scala	Mon Nov 16 09:31:33 2015 +0000
+++++ b/lab2/Text.scala	Thu Feb 04 13:23:01 2016 +0000
++@@ -40,6 +40,46 @@
++         else
++             buffer(max-len+pos)
++     }
+++
+++    /** Find the next occurence of a string from a named index */
+++
+++    def indexOfLoop (str: String, fromIndex: Int): Int = {
+++        val n: Int = str.length()
+++        var i: Int = fromIndex
+++        if (i < n-1) { i = n-1 }
+++        while (i + 1 <= length) {
+++            i += 1
+++            if (str == getString(i-n, n)) {
+++                /** The index of the final character in the sequence is returned */
+++                return i
+++            }
+++        }
+++        /** If the end of the file is reached, the search loops to the beginning */
+++        i = n-1
+++        if (fromIndex >= n-1) {
+++            while (i < fromIndex) {
+++                i += 1
+++                if (str == getString(i-n, n)) {
+++                    return i
+++                }
+++            }
+++        }
+++        -1
+++    }
+++
+++    def indexOf (str: String, fromIndex: Int): Int = {
+++        val n: Int = str.length()
+++        var i: Int = fromIndex
+++        if (i < n-1) { i = n-1 }
+++        while (i + 1 <= length) {
+++            i += 1
+++            if (str == getString(i-n, n)) {
+++                /** The index of the final character in the sequence is returned */
+++                return i
+++            }
+++        }
+++        -1
+++    }
++     
++     // Mutators: any changes or additions here require similar changes to
++     // the subclass PlaneText (the fragile base class problem).
+diff -r 1c5e7f81115c lab2/scala-2.11.4.deb
+Binary file lab2/scala-2.11.4.deb has changed
+diff -r 1c5e7f81115c lab2/testrun.log
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/lab2/testrun.log	Thu Feb 04 13:25:53 2016 +0000
+@@ -0,0 +1,16 @@
++Test Run By alicehenshaw on Sun Dec 13 17:22:34 2015
++Native configuration is x86_64-unknown-linux-gnu
++
++		===  tests ===
++
++Schedule of variations:
++    unix
++
++Running target unix
++Using /usr/share/dejagnu/baseboards/unix.exp as board description file for target.
++Using /usr/share/dejagnu/config/unix.exp as generic interface file for target.
++WARNING: Couldn't find tool config file for unix, using default.
++
++		===  Summary ===
++
++runtest completed at Sun Dec 13 17:22:34 2015
+diff -r 1c5e7f81115c lab2/testrun.sum
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/lab2/testrun.sum	Thu Feb 04 13:25:53 2016 +0000
+@@ -0,0 +1,12 @@
++Test Run By alicehenshaw on Sun Dec 13 17:22:34 2015
++Native configuration is x86_64-unknown-linux-gnu
++
++		===  tests ===
++
++Schedule of variations:
++    unix
++
++Running target unix
++
++		===  Summary ===
++
